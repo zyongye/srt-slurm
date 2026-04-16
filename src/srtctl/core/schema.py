@@ -647,7 +647,7 @@ class ProfilingConfig:
             return []
 
         cmd = [
-            "nsys",
+            "/opt/nvidia/nsight-systems/2025.5.2/target-linux-sbsa-armv8/nsys",
             "profile",
             "-t",
             "cuda,nvtx",
@@ -863,18 +863,20 @@ class SrtConfig:
         has_agg_prof = prof.aggregated is not None
 
         # Validate phase configs match serving mode
+        has_prefill_workers = (r.prefill_workers or 0) > 0
+        has_decode_workers = (r.decode_workers or 0) > 0
         if is_disaggregated:
             if has_agg_prof:
                 raise ValidationError(
                     "Disaggregated mode only supports profiling.prefill/decode; profiling.aggregated is not allowed."
                 )
-            if not has_prefill_prof or not has_decode_prof:
-                raise ValidationError(
-                    "Disaggregated mode requires both profiling.prefill and profiling.decode "
-                    "to be set when profiling is enabled."
-                )
-            if (r.prefill_workers or 0) <= 0 or (r.decode_workers or 0) <= 0:
-                raise ValidationError("Disaggregated mode requires prefill_workers and decode_workers to be > 0.")
+            # Allow prefill-only or decode-only; just require profiling config matches active workers
+            if has_prefill_workers and not has_prefill_prof:
+                raise ValidationError("profiling.prefill must be set when prefill_workers > 0 and profiling is enabled.")
+            if has_decode_workers and not has_decode_prof:
+                raise ValidationError("profiling.decode must be set when decode_workers > 0 and profiling is enabled.")
+            if not has_prefill_workers and not has_decode_workers:
+                raise ValidationError("Disaggregated mode requires prefill_workers or decode_workers to be > 0.")
         else:
             if has_prefill_prof or has_decode_prof:
                 raise ValidationError(

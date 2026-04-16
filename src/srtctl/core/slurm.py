@@ -148,6 +148,7 @@ def start_srun_process(
     env_to_pass_through: list[str] | None = None,
     env_to_set: dict[str, str] | None = None,
     bash_preamble: str | None = None,
+    dynamic_env_script: str | None = None,
     srun_options: dict[str, str] | None = None,
     overlap: bool = True,
     use_bash_wrapper: bool = True,
@@ -172,6 +173,7 @@ def start_srun_process(
         env_to_pass_through: Environment variable names to pass through
         env_to_set: Environment variables to set (name -> value)
         bash_preamble: Bash commands to run before the main command
+        dynamic_env_script: Bash fragment run after static env exports (supports shell var expansion like $PMIX_RANK)
         srun_options: Additional srun options as dict
         overlap: Use --overlap flag (default: True)
         use_bash_wrapper: Wrap command in bash -c (default: True)
@@ -253,6 +255,10 @@ def start_srun_process(
         if env_to_set:
             for name, value in env_to_set.items():
                 bash_parts.append(f"export {name}={shlex.quote(value)}")
+
+        # Dynamic env vars (run after static exports; supports shell expansion like $PMIX_RANK)
+        if dynamic_env_script:
+            bash_parts.append(dynamic_env_script)
 
         # Add the main command
         bash_parts.append(shlex.join(command))

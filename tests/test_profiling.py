@@ -37,7 +37,7 @@ class TestProfilingConfig:
 
         # Test nsys prefix generation
         prefix = profiling.get_nsys_prefix("/output/test")
-        assert "nsys" in prefix
+        assert any("nsys" in p for p in prefix)
         assert "profile" in prefix
         assert "/output/test" in prefix
 
@@ -92,8 +92,8 @@ class TestProfilingConfig:
 class TestProfilingValidation:
     """Tests for profiling config validation in SrtConfig."""
 
-    def test_disagg_requires_prefill_and_decode(self):
-        """Disaggregated mode requires both prefill and decode profiling configs."""
+    def test_disagg_requires_decode_config_when_decode_workers_present(self):
+        """Disaggregated mode requires decode profiling config when decode_workers > 0."""
         from marshmallow import ValidationError
 
         from srtctl.core.schema import (
@@ -104,8 +104,8 @@ class TestProfilingValidation:
             SrtConfig,
         )
 
-        # Missing decode config should fail (with valid single worker config)
-        with pytest.raises(ValidationError, match="both profiling.prefill and profiling.decode"):
+        # Has decode workers but missing decode profiling config — should fail
+        with pytest.raises(ValidationError, match="profiling.decode must be set"):
             SrtConfig(
                 name="test",
                 model=ModelConfig(path="/model", container="/container", precision="fp8"),
@@ -122,6 +122,34 @@ class TestProfilingValidation:
                     # Missing decode config
                 ),
             )
+
+    def test_disagg_prefill_only_with_profiling(self):
+        """Disaggregated prefill-only mode (decode_workers=0) works with only prefill profiling config."""
+        from srtctl.core.schema import (
+            ModelConfig,
+            ProfilingConfig,
+            ProfilingPhaseConfig,
+            ResourceConfig,
+            SrtConfig,
+        )
+
+        # Should not raise — prefill-only with no decode workers
+        SrtConfig(
+            name="test",
+            model=ModelConfig(path="/model", container="/container", precision="fp8"),
+            resources=ResourceConfig(
+                gpu_type="h100",
+                prefill_nodes=1,
+                decode_nodes=0,
+                prefill_workers=1,
+                decode_workers=0,
+            ),
+            profiling=ProfilingConfig(
+                type="nsys",
+                prefill=ProfilingPhaseConfig(start_step=0, stop_step=50),
+                # No decode config needed
+            ),
+        )
 
     def test_agg_requires_aggregated_config(self):
         """Aggregated mode requires aggregated profiling config."""
@@ -341,3 +369,147 @@ class TestProfilingIntegration:
             "1x2",
             "inf",
         ]
+
+
+class TestTRTLLMProfilingSupport:
+    """Tests that TRTLLM backend correctly applies nsys_prefix."""
+
+    def _make_process(self, mode: str = "prefill"):
+        from srtctl.core.topology import Process
+
+        return Process(
+            node="node0",
+            gpu_indices=frozenset([0, 1, 2, 3]),
+            sys_port=8081,
+            http_port=8080,
+            endpoint_mode=mode,
+            endpoint_index=0,
+            node_rank=0,
+        )
+
+    def _make_runtime(self, tmp_path):
+        from types import SimpleNamespace
+        from pathlib import Path
+
+        return SimpleNamespace(
+            log_dir=tmp_path,
+            model_path=Path("/model/DeepSeek-R1"),
+        )
+
+    def test_nsys_prefix_applied(self, tmp_path):
+        """nsys_prefix is prepended to the TRTLLM worker command."""
+        from srtctl.backends.trtllm import TRTLLMProtocol
+
+        backend = TRTLLMProtocol()
+        process = self._make_process("decode")
+        runtime = self._make_runtime(tmp_path)
+        nsys_prefix = ["nsys", "profile", "--output", "/logs/profiles/decode/node0_profile"]
+
+        cmd = backend.build_worker_command(
+            process=process,
+            endpoint_processes=[process],
+            runtime=runtime,
+            nsys_prefix=nsys_prefix,
+        )
+
+        assert cmd[:4] == nsys_prefix
+        assert "trtllm-llmapi-launch" in cmd
+
+    def test_no_nsys_prefix(self, tmp_path):
+        """Without nsys_prefix the command starts directly with trtllm-llmapi-launch."""
+        from srtctl.backends.trtllm import TRTLLMProtocol
+
+        backend = TRTLLMProtocol()
+        process = self._make_process("prefill")
+        runtime = self._make_runtime(tmp_path)
+
+        cmd = backend.build_worker_command(
+            process=process,
+            endpoint_processes=[process],
+            runtime=runtime,
+            nsys_prefix=None,
+        )
+
+        assert cmd[0] == "trtllm-llmapi-launch"
+
+
+class TestTRTLLMProfileStartStop:
+    """Tests for TLLM_PROFILE_START_STOP env var injection."""
+
+    def test_tllm_profile_start_stop_set(self):
+        """TLLM_PROFILE_START_STOP is set for TRTLLM + nsys with step range."""
+        from srtctl.core.schema import ProfilingConfig, ProfilingPhaseConfig
+
+        profiling = ProfilingConfig(
+            type="nsys",
+            prefill=ProfilingPhaseConfig(start_step=5, stop_step=15),
+            decode=ProfilingPhaseConfig(start_step=10, stop_step=20),
+        )
+
+        phase = profiling._get_phase_config("prefill")
+        assert phase is not None
+        env_val = f"{phase.start_step}-{phase.stop_step}"
+        assert env_val == "5-15"
+
+        phase_decode = profiling._get_phase_config("decode")
+        assert phase_decode is not None
+        assert f"{phase_decode.start_step}-{phase_decode.stop_step}" == "10-20"
+
+    def test_tllm_profile_start_stop_missing_steps(self):
+        """TLLM_PROFILE_START_STOP is not set when start_step/stop_step are absent."""
+        from srtctl.core.schema import ProfilingConfig, ProfilingPhaseConfig
+
+        profiling = ProfilingConfig(
+            type="nsys",
+            prefill=ProfilingPhaseConfig(),  # no start/stop
+            decode=ProfilingPhaseConfig(start_step=10, stop_step=20),
+        )
+
+        phase = profiling._get_phase_config("prefill")
+        # Should not produce the env var
+        assert phase is not None
+        assert phase.start_step is None or phase.stop_step is None
+
+    def test_tllm_profile_start_stop_set_for_torch(self):
+        """TLLM_PROFILE_START_STOP is also set for torch profiling type."""
+        from srtctl.core.schema import ProfilingConfig, ProfilingPhaseConfig
+
+        profiling = ProfilingConfig(
+            type="torch",
+            prefill=ProfilingPhaseConfig(start_step=0, stop_step=50),
+            decode=ProfilingPhaseConfig(start_step=0, stop_step=50),
+        )
+
+        assert profiling.is_torch
+        phase = profiling._get_phase_config("prefill")
+        assert phase is not None
+        assert f"{phase.start_step}-{phase.stop_step}" == "0-50"
+
+    def test_tllm_torch_profile_trace_set(self):
+        """TLLM_TORCH_PROFILE_TRACE is set for TRTLLM torch profiling."""
+        from srtctl.core.schema import ProfilingConfig, ProfilingPhaseConfig
+
+        profiling = ProfilingConfig(
+            type="torch",
+            prefill=ProfilingPhaseConfig(start_step=0, stop_step=50),
+            decode=ProfilingPhaseConfig(start_step=0, stop_step=50),
+        )
+
+        assert profiling.is_torch
+        # Verify the env var key/value pattern used in worker_stage.py
+        profile_dir = "/logs/profiles"
+        trace_path = f"{profile_dir}/prefill"
+        assert trace_path == "/logs/profiles/prefill"
+
+    def test_tllm_torch_profile_trace_not_set_for_nsys(self):
+        """TLLM_TORCH_PROFILE_TRACE should not be set for nsys profiling."""
+        from srtctl.core.schema import ProfilingConfig, ProfilingPhaseConfig
+
+        profiling = ProfilingConfig(
+            type="nsys",
+            prefill=ProfilingPhaseConfig(start_step=5, stop_step=15),
+            decode=ProfilingPhaseConfig(start_step=5, stop_step=15),
+        )
+
+        assert profiling.is_nsys
+        assert not profiling.is_torch

@@ -94,7 +94,12 @@ class WorkerStageMixin:
         profiling = self.config.profiling
         nsys_prefix = None
         if profiling.enabled:
-            (self.runtime.log_dir / "profiles" / mode).mkdir(parents=True, exist_ok=True)
+            if self.backend.type == "trtllm" and profiling.is_torch:
+                # TRTLLM writes TLLM_TORCH_PROFILE_TRACE as a file (writes .tmp then renames),
+                # so only create the parent profiles/ dir, not profiles/{mode}/ which would block the rename
+                (self.runtime.log_dir / "profiles").mkdir(parents=True, exist_ok=True)
+            else:
+                (self.runtime.log_dir / "profiles" / mode).mkdir(parents=True, exist_ok=True)
         if profiling.is_nsys:
             nsys_output = f"/logs/profiles/{mode}/{process.node}_{mode}_w{index}_profile"
             nsys_prefix = profiling.get_nsys_prefix(nsys_output, frontend_type=self.config.frontend.type)
@@ -139,8 +144,16 @@ class WorkerStageMixin:
 
         # Add profiling environment variables
         if profiling.enabled:
-            profile_dir = str(self.runtime.log_dir / "profiles")
+            # Use the container-side path (/logs) since env vars are read inside the container
+            profile_dir = "/logs/profiles"
             env_to_set.update(profiling.get_env_vars(mode, profile_dir))
+            # TRTLLM profiling: step range and trace path use TRTLLM-specific env vars
+            if self.backend.type == "trtllm":
+                phase = profiling._get_phase_config(mode)
+                if phase and phase.start_step is not None and phase.stop_step is not None:
+                    env_to_set["TLLM_PROFILE_START_STOP"] = f"{phase.start_step}-{phase.stop_step}"
+                if profiling.is_torch:
+                    env_to_set["TLLM_TORCH_PROFILE_TRACE"] = f"{profile_dir}/{mode}_w{index}"
 
         # Set CUDA_VISIBLE_DEVICES if not using all GPUs
         if len(process.gpu_indices) < self.runtime.gpus_per_node:
@@ -212,10 +225,18 @@ class WorkerStageMixin:
         profiling = self.config.profiling
         nsys_prefix = None
         if profiling.enabled:
-            (self.runtime.log_dir / "profiles" / mode).mkdir(parents=True, exist_ok=True)
+            if self.backend.type == "trtllm" and profiling.is_torch:
+                # TRTLLM writes TLLM_TORCH_PROFILE_TRACE as a file (writes .tmp then renames),
+                # so only create the parent profiles/ dir, not profiles/{mode}/ which would block the rename
+                (self.runtime.log_dir / "profiles").mkdir(parents=True, exist_ok=True)
+            else:
+                (self.runtime.log_dir / "profiles" / mode).mkdir(parents=True, exist_ok=True)
         if profiling.is_nsys:
             nsys_output = f"/logs/profiles/{mode}/{leader.node}_{mode}_w{index}_profile"
-            nsys_prefix = profiling.get_nsys_prefix(nsys_output, frontend_type=self.config.frontend.type)
+            # TRTLLM uses MPI/PMIx launching — do NOT pass frontend_type here.
+            # --trace-fork-before-exec=true (added for dynamo frontend) intercepts PMIx fork()/exec()
+            # calls and deadlocks MPI initialization after the first request.
+            nsys_prefix = profiling.get_nsys_prefix(nsys_output, frontend_type=None)
 
         # Build command using backend's method
         cmd = self.backend.build_worker_command(
@@ -243,12 +264,27 @@ class WorkerStageMixin:
 
         # Add profiling environment variables
         if profiling.enabled:
-            profile_dir = str(self.runtime.log_dir / "profiles")
+            # Use the container-side path (/logs) since env vars are read inside the container
+            profile_dir = "/logs/profiles"
             env_to_set.update(profiling.get_env_vars(mode, profile_dir))
+            # TRTLLM profiling: step range and trace path use TRTLLM-specific env vars
+            if self.backend.type == "trtllm":
+                phase = profiling._get_phase_config(mode)
+                if phase and phase.start_step is not None and phase.stop_step is not None:
+                    env_to_set["TLLM_PROFILE_START_STOP"] = f"{phase.start_step}-{phase.stop_step}"
+                # TLLM_TORCH_PROFILE_TRACE must be rank-specific to avoid MPI ranks racing on the
+                # same .tmp file. Set it via dynamic_env_script so ${PMIX_RANK} expands per task.
 
         # Set CUDA_VISIBLE_DEVICES if not using all GPUs on the node
         if len(leader.gpu_indices) < self.runtime.gpus_per_node:
             env_to_set["CUDA_VISIBLE_DEVICES"] = leader.cuda_visible_devices
+
+        # Build rank-specific torch profile trace path for TRTLLM MPI mode.
+        # Each MPI rank writes its own trace file to avoid concurrent .tmp file conflicts.
+        dynamic_env_script = None
+        if profiling.enabled and profiling.is_torch and self.backend.type == "trtllm":
+            trace_base = f"{profile_dir}/{mode}_w{index}"
+            dynamic_env_script = f"export TLLM_TORCH_PROFILE_TRACE={trace_base}_rank${{PMIX_RANK}}"
 
         # Log env vars in the format: VAR=value VAR2=value2
         env_str = " ".join(f"{k}={v}" for k, v in sorted(env_to_set.items()))
@@ -274,6 +310,7 @@ class WorkerStageMixin:
             container_mounts=self.runtime.container_mounts,
             env_to_set=env_to_set,
             bash_preamble=bash_preamble,
+            dynamic_env_script=dynamic_env_script,
             mpi=srun_config.mpi,
             oversubscribe=srun_config.oversubscribe,
             cpu_bind=srun_config.cpu_bind,

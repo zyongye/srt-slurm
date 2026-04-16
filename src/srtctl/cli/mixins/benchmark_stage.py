@@ -215,43 +215,57 @@ class BenchmarkStageMixin:
         if p.is_torch:
             env["SGLANG_TORCH_PROFILER_DIR"] = profiles_dir_in_container
 
-        # Collect worker leader IPs and system server ports by mode
-        prefill_ips = []
-        decode_ips = []
-        agg_ips = []
-        prefill_endpoints = []
-        decode_endpoints = []
-        agg_endpoints = []
-
-        use_sys_port = self.config.frontend.type == "dynamo"
-        for process in self.backend_processes:
-            if not process.is_leader:
-                continue
-            leader_ip = get_hostname_ip(process.node, self.runtime.network_interface)
-            port = process.sys_port if use_sys_port else process.http_port
-            leader_endpoint = f"{leader_ip}:{port}"
-            if process.endpoint_mode == "prefill":
-                prefill_ips.append(leader_ip)
-                prefill_endpoints.append(leader_endpoint)
-            elif process.endpoint_mode == "decode":
-                decode_ips.append(leader_ip)
-                decode_endpoints.append(leader_endpoint)
-            elif process.endpoint_mode == "agg":
-                agg_ips.append(leader_ip)
-                agg_endpoints.append(leader_endpoint)
-
-        if prefill_ips:
-            env["PROFILE_PREFILL_IPS"] = ",".join(prefill_ips)
-        if decode_ips:
-            env["PROFILE_DECODE_IPS"] = ",".join(decode_ips)
-        if agg_ips:
-            env["PROFILE_AGG_IPS"] = ",".join(agg_ips)
-        if prefill_endpoints:
-            env["PROFILE_PREFILL_ENDPOINTS"] = ",".join(prefill_endpoints)
-        if decode_endpoints:
-            env["PROFILE_DECODE_ENDPOINTS"] = ",".join(decode_endpoints)
-        if agg_endpoints:
-            env["PROFILE_AGG_ENDPOINTS"] = ",".join(agg_endpoints)
+        # Collect worker endpoints for profiling API calls.
+        # For dynamo frontend: profiling is handled through the gateway (dynamo_llm HTTP service),
+        # which broadcasts the profiling command to all backend workers via NATS.
+        # Individual dynamo workers only expose a system_status_server (health/metrics) and do not
+        # have an HTTP engine management API. The gateway is at HEAD_NODE:frontend_port.
+        if self.config.frontend.type == "dynamo":
+            head_ip = get_hostname_ip(self.runtime.nodes.head, self.runtime.network_interface)
+            gateway_endpoint = f"{head_ip}:{self.runtime.frontend_port}"
+            modes = {p.endpoint_mode for p in self.backend_processes if p.is_leader}
+            if "prefill" in modes:
+                env["PROFILE_PREFILL_IPS"] = head_ip
+                env["PROFILE_PREFILL_ENDPOINTS"] = gateway_endpoint
+            if "decode" in modes:
+                env["PROFILE_DECODE_IPS"] = head_ip
+                env["PROFILE_DECODE_ENDPOINTS"] = gateway_endpoint
+            if "agg" in modes:
+                env["PROFILE_AGG_IPS"] = head_ip
+                env["PROFILE_AGG_ENDPOINTS"] = gateway_endpoint
+        else:
+            prefill_ips: list[str] = []
+            decode_ips: list[str] = []
+            agg_ips: list[str] = []
+            prefill_endpoints: list[str] = []
+            decode_endpoints: list[str] = []
+            agg_endpoints: list[str] = []
+            for process in self.backend_processes:
+                if not process.is_leader:
+                    continue
+                leader_ip = get_hostname_ip(process.node, self.runtime.network_interface)
+                leader_endpoint = f"{leader_ip}:{process.http_port}"
+                if process.endpoint_mode == "prefill":
+                    prefill_ips.append(leader_ip)
+                    prefill_endpoints.append(leader_endpoint)
+                elif process.endpoint_mode == "decode":
+                    decode_ips.append(leader_ip)
+                    decode_endpoints.append(leader_endpoint)
+                elif process.endpoint_mode == "agg":
+                    agg_ips.append(leader_ip)
+                    agg_endpoints.append(leader_endpoint)
+            if prefill_ips:
+                env["PROFILE_PREFILL_IPS"] = ",".join(prefill_ips)
+            if decode_ips:
+                env["PROFILE_DECODE_IPS"] = ",".join(decode_ips)
+            if agg_ips:
+                env["PROFILE_AGG_IPS"] = ",".join(agg_ips)
+            if prefill_endpoints:
+                env["PROFILE_PREFILL_ENDPOINTS"] = ",".join(prefill_endpoints)
+            if decode_endpoints:
+                env["PROFILE_DECODE_ENDPOINTS"] = ",".join(decode_endpoints)
+            if agg_endpoints:
+                env["PROFILE_AGG_ENDPOINTS"] = ",".join(agg_endpoints)
 
         # Set profile output directory and common env vars for benchmarks that support profiling
         if runner.name in ("SA-Bench", "SGLang-Bench"):
